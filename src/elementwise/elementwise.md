@@ -1,6 +1,6 @@
-# elementwise
+# elementwise_add
 
-## elementwise_naive
+## elementwise_add_naive
 
 ```cuda
 __global__ void elementwise_add_naive(const float* a, const float* b, float* c, unsigned n) {
@@ -16,7 +16,7 @@ __global__ void elementwise_add_naive(const float* a, const float* b, float* c, 
 1. 这个kernel是内存受限的
 2. 对于3090，一个thread使用40个以下的寄存器是可以打到理论100的占用率的，所以要一个thread计算更多的数据
 
-## elementwise_four
+## elementwise_add_four
 
 ```cuda
 __global__ void elementwise_add_four(const float* a, const float* b, float* c, unsigned n) {
@@ -35,7 +35,7 @@ __global__ void elementwise_add_four(const float* a, const float* b, float* c, u
 因为这个kernel的瓶颈在于把数据从全局内存中读取然后再写入全局内存的过程，而并不是计算的过程。继续优化就应当注重别的方面：这个按元素加法怎么配合别的kernel？能不能使用半精度？因为半精度相当于读写同样大小的全局内存但是处理了两倍的数据。
 如果实在想对这个kernel进行提升，还可以向量化
 
-## elementwise_vectorize
+## elementwise_add_vectorize
 
 ```cuda
 __global__ void elementwise_add_vectorize(float* a, float* b, float* c, unsigned n) {
@@ -59,3 +59,24 @@ __global__ void elementwise_add_vectorize(float* a, float* b, float* c, unsigned
 ## 总结
 
 以上的几个写法，在最终性能上几乎没有差别，对于这种简单的计算，就不要费心思优化kernel本身了
+
+# sigmoid
+
+$$
+F(x) = \frac{1}{1+e^{-x}}
+$$
+
+仍然是elementwise类型的计算，写了两个版本的代码：
+```cuda
+__global__ void sigmoid_naive(float* x, float* y, unsigned n) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx < n) y[idx] = 1 / (1 + exp(-1 * x[idx]));
+}
+
+__global__ void sigmoid_arithmetic(float* x, float* y, unsigned n) {
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx < n) y[idx] = __fdividef(1, 1 + __expf(-1 * x[idx]));
+}
+```
+
+对于$2^{30}$个浮点数，前者用时约10.09ms，后者用时约10.07ms，几乎起不到加速，因为elementwise类型的kernel主要瓶颈还是在访存上，前面讨论过了。

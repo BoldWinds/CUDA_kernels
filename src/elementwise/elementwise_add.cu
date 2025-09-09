@@ -46,41 +46,54 @@ int main(){
     // ---------------------------------
     // naive
     // ---------------------------------
-    generateRandomData(a, n);
-    generateRandomData(b, n);
+    
     int threadsPerBlock = 256;
     int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
-    timer->start();
-    elementwise_add_naive<<<blocksPerGrid, threadsPerBlock>>>(a, b, c, n);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    timer->stop();
-    std::cout << "naive: " << timer->elapsed() << std::endl;
+    double duration_naive = 0.0;
+    for(int i = 0; i < 10; i++) {
+        generateRandomData(a, n);
+        generateRandomData(b, n);
+        timer->start();
+        elementwise_add_naive<<<blocksPerGrid, threadsPerBlock>>>(a, b, c, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        timer->stop();
+        duration_naive += timer->elapsed();
+    }
+    std::cout << "naive: " << duration_naive/10 << std::endl;
 
     // ---------------------------------
     // 一个线程处理多个数据
     // ---------------------------------
-    generateRandomData(a, n);
-    generateRandomData(b, n);
     threadsPerBlock = 256;
     blocksPerGrid = (n + threadsPerBlock * 4 - 1) / (threadsPerBlock * 4);
-    timer->start();
-    elementwise_add_four<<<blocksPerGrid, threadsPerBlock>>>(a, b, c, n);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    timer->stop();
-    std::cout << "four: " << timer->elapsed() << std::endl;
+    double duration_four = 0.0;
+    for(int i = 0; i < 10; i++) {
+        generateRandomData(a, n);
+        generateRandomData(b, n);
+        timer->start();
+        elementwise_add_four<<<blocksPerGrid, threadsPerBlock>>>(a, b, c, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        timer->stop();
+        duration_four += timer->elapsed();
+    }
+    std::cout << "four: " << duration_naive/10 << std::endl;
 
     // ---------------------------------
     // 一个线程处理多个数据(向量化)
     // ---------------------------------
-    generateRandomData(a, n);
-    generateRandomData(b, n);
     threadsPerBlock = 256;
     blocksPerGrid = (n + threadsPerBlock * 4 - 1) / (threadsPerBlock * 4);
-    timer->start();
-    elementwise_add_vectorize<<<blocksPerGrid, threadsPerBlock>>>(a, b, c, n);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    timer->stop();
-    std::cout << "vectorize: " << timer->elapsed() << std::endl;
+    double duration_vectorize = 0.0;
+    for(int i = 0; i < 10; i++) {
+        generateRandomData(a, n);
+        generateRandomData(b, n);
+        timer->start();
+        elementwise_add_vectorize<<<blocksPerGrid, threadsPerBlock>>>(a, b, c, n);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        timer->stop();
+        duration_vectorize += timer->elapsed();
+    }
+    std::cout << "vectorize: " << duration_naive/10 << std::endl;
 
     CUDA_CHECK(cudaFree(a));
     CUDA_CHECK(cudaFree(b));
