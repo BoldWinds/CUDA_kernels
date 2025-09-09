@@ -54,17 +54,11 @@ template<>
 void generateRandomData<__half>(__half* d_data, size_t n, unsigned long long seed) {
     float* d_temp_floats;
     CUDA_CHECK(cudaMalloc(&d_temp_floats, n * sizeof(float)));
-
-    curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, seed);
-    generateRandomData<float>(d_temp_floats, n, seed);
-    curandDestroyGenerator(gen);
-
+    generateRandomData(d_temp_floats, n, seed);
+    
     int threadsPerBlock = 256;
     int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
     floatToHalfKernel<<<blocksPerGrid, threadsPerBlock>>>(d_data, d_temp_floats, n);
     CUDA_CHECK(cudaGetLastError());
-
     CUDA_CHECK(cudaFree(d_temp_floats));
 }
