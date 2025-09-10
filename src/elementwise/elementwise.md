@@ -93,3 +93,14 @@ __global__ void sigmoid_arithmetic(float* x, float* y, unsigned n) {
 ```
 
 对于$2^{30}$个浮点数，前者用时约10.09ms，后者用时约10.07ms，几乎起不到加速，因为elementwise类型的kernel主要瓶颈还是在访存上，前面讨论过了。
+
+# gelu
+
+计算稍微麻烦些：
+$$
+GELU(x) = 0.5x(1+tanh(\sqrt{2/\pi}(x+0.044715x^3)))
+$$
+
+单精度计算中，使用float4优化的版本提升了约12.8%的内存吞吐率，因此耗时从11.41ms降至10.11ms;
+半精度计算中，使用half2优化的版本提升了约25%的内存吞吐率，耗时从6.9ms降到5.08ms
+

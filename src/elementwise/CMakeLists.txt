@@ -27,3 +27,17 @@ target_link_libraries(sigmoid PRIVATE
 set_target_properties(sigmoid PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+add_executable(gelu
+    gelu.cu
+)
+
+target_link_libraries(gelu PRIVATE 
+    CUDA::cudart
+    CUDA::curand
+    common_headers
+)
+
+set_target_properties(gelu PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
