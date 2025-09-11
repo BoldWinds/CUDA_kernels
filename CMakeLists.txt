@@ -19,3 +19,4 @@ target_include_directories(common_headers INTERFACE
 )
 
 add_subdirectory(src/elementwise)
+add_subdirectory(src/transpose)

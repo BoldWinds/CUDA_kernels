@@ -1,12 +1,81 @@
 #include "timer.h"
 #include <cublas_v2.h>
 
-__global__ void transpose_naive(float* matrix_input, float* matrix_output, unsigned rows, unsigned cols){
+__global__ void verify_transpose_kernel(const float* input, const float* output, unsigned rows, unsigned cols, int* error_count) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < rows && col < cols) {
+        int index_A = row * cols + col;
+        int index_B = col * rows + row;
+
+        float val_A = input[index_A];
+        float val_B = output[index_B];
+
+        const float epsilon = 1e-6f;
+        if (fabs(val_A - val_B) > epsilon) {
+            atomicAdd(error_count, 1);
+        }
+    }
+}
+
+void verify_transpose(const float* input, const float* output, unsigned rows, unsigned cols, int* error_count) {
+    dim3 blockDim(16, 16);
+    dim3 gridDim((cols + blockDim.x - 1) / blockDim.x, (rows + blockDim.y - 1) / blockDim.y);
+    
+    CUDA_CHECK(cudaMemset(error_count, 0, sizeof(int)));
+    verify_transpose_kernel<<<gridDim, blockDim>>>(input, output, rows, cols, error_count);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
+
+    int h_error_count = 0;
+    CUDA_CHECK(cudaMemcpy(&h_error_count, error_count, sizeof(int), cudaMemcpyDeviceToHost));
+
+    if (h_error_count != 0) {
+        std::cout << "ERROR: Verification failed! Found " << h_error_count << " mismatch(es)." << std::endl;
+        std::cout << "       The provided matrix is NOT a correct transpose." << std::endl;
+    }
+}
+
+// 写入是合并的
+__global__ void transpose_naive(float* matrix_input, float* matrix_output, unsigned height, unsigned width){
     unsigned row_idx = blockDim.x * blockIdx.x + threadIdx.x;
     unsigned col_idx = blockDim.y * blockIdx.y + threadIdx.y;
 
-    if(col_idx < cols && row_idx < rows) {
-        matrix_output[col_idx * rows + row_idx] = matrix_input[row_idx * cols + col_idx];
+    if(col_idx < width && row_idx < height) {
+        matrix_output[col_idx * height + row_idx] = matrix_input[row_idx * width + col_idx];
+    }
+}
+
+// 读取是合并的
+__global__ void transpose_naive_v2(float* matrix_input, float* matrix_output, unsigned height, unsigned width){
+    unsigned row_idx = blockDim.y * blockIdx.y + threadIdx.y;
+    unsigned col_idx = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if(col_idx < width && row_idx < height) {
+        matrix_output[col_idx * height + row_idx] = matrix_input[row_idx * width + col_idx];
+    }
+}
+
+// 写入合并
+__global__ void transpose_naive_1D(float* matrix_input, float* matrix_output, const unsigned height, const unsigned width){
+    const unsigned block_per_column = (height + blockDim.x - 1) / blockDim.x;
+    const unsigned row_idx = (blockIdx.x % block_per_column) * blockDim.x + threadIdx.x;
+    const unsigned col_idx = blockIdx.x / block_per_column;
+
+    if(row_idx < height) {
+        matrix_output[col_idx * height + row_idx] = matrix_input[row_idx * width + col_idx];
+    }
+}
+
+// 读取合并
+__global__ void transpose_naive_1D_v2(float* matrix_input, float* matrix_output, const unsigned height, const unsigned width){
+    const unsigned block_per_row = (width + blockDim.x - 1) / blockDim.x;
+    const unsigned row_idx = blockIdx.x / block_per_row;
+    const unsigned col_idx = (blockIdx.x % block_per_row) * blockDim.x + threadIdx.x;
+
+    if(col_idx < width) {
+        matrix_output[col_idx * height + row_idx] = matrix_input[row_idx * width + col_idx];
     }
 }
 
@@ -30,6 +99,26 @@ __global__ void transpose_x4(float* matrix_input, float* matrix_output, unsigned
     } 
 }
 
+#define TILE_SIZE 16
+
+__global__ void transpose_shared(float* matrix_input, float* matrix_output, const unsigned height, unsigned width) {
+    __shared__ float tile[TILE_SIZE + 1][TILE_SIZE + 1];
+    unsigned row_idx = TILE_SIZE * blockIdx.y + threadIdx.y;
+    unsigned col_idx = TILE_SIZE * blockIdx.x + threadIdx.x;
+
+    if(col_idx < width && row_idx < height) {
+        tile[threadIdx.y][threadIdx.x] = matrix_input[row_idx * width + col_idx];
+    }
+    __syncthreads();
+
+    row_idx = TILE_SIZE * blockIdx.x + threadIdx.y;
+    col_idx = TILE_SIZE * blockIdx.y + threadIdx.x;
+    if(col_idx < width && row_idx < height) {
+        matrix_output[row_idx * height + col_idx] = tile[threadIdx.x][threadIdx.y];
+    }
+
+}
+
 
 int main(int argc, char** argv) {
     if(argc < 2) {
@@ -38,43 +127,46 @@ int main(int argc, char** argv) {
     }
     int max_run = std::atoi(argv[1]);
     float *a, *b;
+    int *error_count;
     const unsigned row = 1<<15, col = 1<<15;
     CUDA_CHECK(cudaMalloc(&a, row * col * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b, row * col * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&error_count, sizeof(int)));
     Timer* timer = new Timer();
-    dim3 threadsPerBlock(16, 16);
     double duration = 0.0;
     
     // ---------------------------------
     // CUBLAS
     // ---------------------------------
     {
+        cublasHandle_t handle;
+        cublasCreate(&handle);
         for(int i = 0; i < max_run; i++) {
             generateRandomData(a, row * col);
             timer->start();
-            cublasHandle_t handle;
-            cublasCreate(&handle);
             const float alpha = 1.0f;
             const float beta = 0.0f;
             cublasSgeam(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                        col, row, &alpha, a, col,
-                        &beta, NULL, row, b, row
-                    );
+                row, col, &alpha, a, col,
+                &beta, NULL, row, b, row
+            );
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
-            cublasDestroy(handle);
             timer->stop();
             duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
         }
+        cublasDestroy(handle);
         std::cout << "cuBLAS: " << duration / max_run << " ms" << std::endl;
-        
+        duration = 0.0;
     }
 
     // ---------------------------------
     // naive
     // ---------------------------------
     {
-        dim3 blocksPerGrid((row + 15)/16, (col+15)/16);
+        dim3 threadsPerBlock(16, 16);
+        dim3 blocksPerGrid((col + 15)/16, (row+15)/16);
         for(int i = 0; i < max_run; i++) {
             generateRandomData(a, row * col);
             timer->start();
@@ -83,8 +175,69 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaDeviceSynchronize());
             timer->stop();
             duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
         }
         std::cout << "naive: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // naivev2
+    // ---------------------------------
+    {
+        dim3 threadsPerBlock(16, 16);
+        dim3 blocksPerGrid((row + 15)/16, (col+15)/16);
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_naive_v2<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+        }
+        std::cout << "naive v2: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // naive 1D
+    // ---------------------------------
+    {
+        unsigned threadsPerBlock = 256;
+        unsigned blocksPerGrid = (row + threadsPerBlock - 1) / threadsPerBlock * col;
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_naive_1D<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+        }
+        std::cout << "naive 1D: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // naive 1D v2
+    // ---------------------------------
+    {
+        unsigned threadsPerBlock = 256;
+        unsigned blocksPerGrid = (col + threadsPerBlock - 1) / threadsPerBlock * row;
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_naive_1D_v2<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+        }
+        std::cout << "naive 1D v2: " << duration/max_run << std::endl;
         duration = 0.0;
     }
 
@@ -92,6 +245,7 @@ int main(int argc, char** argv) {
     // 4x
     // ---------------------------------
     {
+        dim3 threadsPerBlock(16, 16);
         dim3 blocksPerGrid((row + 15)/16, (col/4 + 15)/16);
         for(int i = 0; i < max_run; i++) {
             generateRandomData(a, row * col);
@@ -101,8 +255,29 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaDeviceSynchronize());
             timer->stop();
             duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
         }
         std::cout << "x4: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // shared
+    // ---------------------------------
+    {
+        dim3 threadsPerBlock(TILE_SIZE, TILE_SIZE);
+        dim3 blocksPerGrid((col + TILE_SIZE - 1)/TILE_SIZE, (row + TILE_SIZE - 1)/TILE_SIZE);
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_shared<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+        }
+        std::cout << "shared: " << duration/max_run << std::endl;
         duration = 0.0;
     }
 
