@@ -194,3 +194,39 @@ __global__ void transpose_shared_optimized_x4(float* matrix_input, float* matrix
 
 ## shared async
 
+```cuda
+__global__ void transpose_shared_optimized_async(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+    unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
+    unsigned col_idx = blockIdx.x * TILE_DIM + threadIdx.x;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> tile32 = cg::tiled_partition<32>(block);
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < width && row_idx + i < height){
+            cg::memcpy_async(
+                tile32, 
+                tile[tile32.meta_group_rank() + i], 
+                &matrix_input[(blockIdx.y * TILE_DIM + tile32.meta_group_rank() + i) * width + blockIdx.x * TILE_DIM], 
+                sizeof(float) * tile32.size()
+            );
+        }
+    }
+
+    row_idx = blockIdx.x * TILE_DIM + threadIdx.y;
+    col_idx = blockIdx.y * TILE_DIM + threadIdx.x;
+    cg::wait(block);
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < height && row_idx + i < width){
+            matrix_output[(row_idx + i) * height + col_idx] = tile[threadIdx.x][threadIdx.y + i];
+        }
+    }
+}
+```
+
+使用了memcpy_async. 这种情况下, memcpy_async只能省去数据在寄存器的过程, 这部分过程时间本身就很短. 
+
+和buclas的矩阵转置相比, 目前有两个指标有区别, 一个是Long Scoreboard Stalls, 另一个是Barrier Stalls. 具体一点, 二者相加有每个warp有50 cycles的时间在等待, cublas则只有20. 还有另外一个区别, cublas的实现所用的warp数是我的实现的四分之一, 在block大小一致的情况下, 说明他一个block处理的tile大小是64*64, 下个版本朝着这个方向优化.

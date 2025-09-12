@@ -1,5 +1,8 @@
 #include "timer.h"
 #include <cublas_v2.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
+namespace cg = cooperative_groups;
 
 __global__ void verify_transpose_kernel(const float* input, const float* output, unsigned rows, unsigned cols, int* error_count) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -99,7 +102,6 @@ __global__ void transpose_x4(float* matrix_input, float* matrix_output, unsigned
 }
 
 #define TILE_SIZE 16
-
 __global__ void transpose_shared(const float* matrix_input, float* matrix_output, const unsigned height, unsigned width) {
     __shared__ float tile[TILE_SIZE + 1][TILE_SIZE + 1];
     unsigned row_idx = TILE_SIZE * blockIdx.y + threadIdx.y;
@@ -119,7 +121,7 @@ __global__ void transpose_shared(const float* matrix_input, float* matrix_output
 }
 
 #define TILE_DIM 32
-__global__ void transpose_shared_optimized(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+__global__ void transpose_shared_32(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
     __shared__ float tile[TILE_DIM][TILE_DIM + 1];
     unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
     unsigned col_idx = blockIdx.x * TILE_DIM + threadIdx.x;
@@ -143,7 +145,7 @@ __global__ void transpose_shared_optimized(const float* matrix_input, float* mat
     }
 }
 
-__global__ void transpose_shared_optimized_x4(float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+__global__ void transpose_shared_32_x4(float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
     __shared__ float tile[TILE_DIM][TILE_DIM + 1];
     unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
     unsigned col_idx = blockIdx.x * TILE_DIM + 4 * threadIdx.x;
@@ -166,6 +168,37 @@ __global__ void transpose_shared_optimized_x4(float* matrix_input, float* matrix
     for(int i = 0; i < TILE_DIM; i+=8){
         if(row_idx + i < width && col_idx < height) {
             matrix_output[(row_idx + i) * height + col_idx] = tile[new_col][new_row + i];
+        }
+    }
+}
+
+__global__ void transpose_shared_32_async(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+    unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
+    unsigned col_idx = blockIdx.x * TILE_DIM + threadIdx.x;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> tile32 = cg::tiled_partition<32>(block);
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < width && row_idx + i < height){
+            cg::memcpy_async(
+                tile32, 
+                tile[tile32.meta_group_rank() + i], 
+                &matrix_input[(blockIdx.y * TILE_DIM + tile32.meta_group_rank() + i) * width + blockIdx.x * TILE_DIM], 
+                sizeof(float) * tile32.size()
+            );
+        }
+    }
+
+    row_idx = blockIdx.x * TILE_DIM + threadIdx.y;
+    col_idx = blockIdx.y * TILE_DIM + threadIdx.x;
+    cg::wait(block);
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < height && row_idx + i < width){
+            matrix_output[(row_idx + i) * height + col_idx] = tile[threadIdx.x][threadIdx.y + i];
         }
     }
 }
@@ -348,7 +381,7 @@ int main(int argc, char** argv) {
         for(int i = 0; i < max_run; i++) {
             generateRandomData(a, row * col);
             timer->start();
-            transpose_shared_optimized<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            transpose_shared_32<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
             timer->stop();
@@ -369,7 +402,7 @@ int main(int argc, char** argv) {
         for(int i = 0; i < max_run; i++) {
             generateRandomData(a, row * col);
             timer->start();
-            transpose_shared_optimized_x4<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            transpose_shared_32_x4<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
             timer->stop();
@@ -378,6 +411,27 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "shared opt x4: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // shared opt async
+    // ---------------------------------
+    {
+        dim3 threadsPerBlock(32, 8);
+        dim3 blocksPerGrid((col + 32 - 1)/32, (row + 32 - 1)/32);
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_shared_32_async<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
+        }
+        std::cout << "shared opt async: " << duration/max_run << std::endl;
         duration = 0.0;
     }
 
