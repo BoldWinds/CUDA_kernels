@@ -230,3 +230,53 @@ __global__ void transpose_shared_optimized_async(const float* matrix_input, floa
 使用了memcpy_async. 这种情况下, memcpy_async只能省去数据在寄存器的过程, 这部分过程时间本身就很短. 
 
 和buclas的矩阵转置相比, 目前有两个指标有区别, 一个是Long Scoreboard Stalls, 另一个是Barrier Stalls. 具体一点, 二者相加有每个warp有50 cycles的时间在等待, cublas则只有20. 还有另外一个区别, cublas的实现所用的warp数是我的实现的四分之一, 在block大小一致的情况下, 说明他一个block处理的tile大小是64*64, 下个版本朝着这个方向优化.
+
+## shared x64
+
+一个TILE的大小为64*64, 但是block维度仍然保持(32,8), grid的两个维度全部减半, 在warp数上和cublas版本保持一致
+
+```cuda
+__global__ void transpose_shared_64(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[64][65];
+
+    const unsigned row_start = blockIdx.y * 64;
+    const unsigned col_start = blockIdx.x * 64;
+    unsigned row_idx = row_start + threadIdx.y;
+    unsigned col_idx = col_start + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < 64; i+=8){
+        if(col_idx < width && row_idx + i < height){
+            tile[threadIdx.y + i][threadIdx.x] = matrix_input[(row_idx + i) * width + col_idx];
+            if(col_idx + 32 < width) tile[threadIdx.y + i][threadIdx.x + 32] = matrix_input[(row_idx + i) * width + col_idx + 32];
+        }
+    }
+    __syncthreads();
+
+    row_idx = col_start + threadIdx.y;
+    col_idx = row_start + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < 64; i+=8){
+        if(col_idx < height && row_idx + i < width){
+            matrix_output[(row_idx + i) * height + col_idx] = tile[threadIdx.x][threadIdx.y + i];
+            if(col_idx + 32 < height) matrix_output[(row_idx + i) * height + col_idx + 32] = tile[threadIdx.x + 32][threadIdx.y + i];
+        }
+    }
+}
+```
+
+这个版本的代码实现了cublas版本99.5%的性能, 可以说几乎一样了. 
+
+为了更好的对比, 我又写了一版不使用shared memory, tile大小为$64\*64$的naive版本, 性能远远落后该版本, 证明了shared memory在这种一个thread处理多个数据的情况会比较有用
+
+## 总结
+
+从transpose这一个kernel的优化历程, 可以总结出一系列对于transpose这种计算压力很小但是内存压力比较大的kernel的优化方法:
+1. 处理矩阵, 使用二维TILE, 否则cache抖动会产生大量的冗余读取/写入, 严重影响性能
+2. 处理非合并的写入优先于处理非合并的读取
+3. Shared Memory是一个让读取和写入都能合并的好解决方案
+4. 在transpose这个kernel中, 让每个thread处理16个单精度元素能获得比较高的性能
+5. 注意bank conflict, 添加padding可以有效解决
+6. memcpy_async在这种不怎么需要计算的kernel中不太有用
+7. 向量化读取/写入有奇效, 但是也算是一种cheating

@@ -49,6 +49,19 @@ __global__ void transpose_naive(float* matrix_input, float* matrix_output, unsig
     }
 }
 
+__global__ void transpose_naive_64(float* matrix_input, float* matrix_output, unsigned height, unsigned width){
+    unsigned row_idx = 64 * blockIdx.x + threadIdx.x;
+    unsigned col_idx = 64 * blockIdx.y + threadIdx.y;
+
+    #pragma unroll
+    for(int i = 0; i < 64; i+=8){
+        if(col_idx + i< width && row_idx < height){
+            matrix_output[(col_idx + i) * height + row_idx] = matrix_input[row_idx * width + col_idx + i];
+            if(row_idx + 32 < height) matrix_output[(col_idx + i) * height + row_idx + 32] = matrix_input[(row_idx + 32) * width + col_idx + i];
+        }
+    }
+}
+
 // 读取是合并的
 __global__ void transpose_naive_v2(float* matrix_input, float* matrix_output, unsigned height, unsigned width){
     unsigned row_idx = blockDim.y * blockIdx.y + threadIdx.y;
@@ -203,6 +216,34 @@ __global__ void transpose_shared_32_async(const float* matrix_input, float* matr
     }
 }
 
+__global__ void transpose_shared_64(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[64][65];
+
+    const unsigned row_start = blockIdx.y * 64;
+    const unsigned col_start = blockIdx.x * 64;
+    unsigned row_idx = row_start + threadIdx.y;
+    unsigned col_idx = col_start + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < 64; i+=8){
+        if(col_idx < width && row_idx + i < height){
+            tile[threadIdx.y + i][threadIdx.x] = matrix_input[(row_idx + i) * width + col_idx];
+            if(col_idx + 32 < width) tile[threadIdx.y + i][threadIdx.x + 32] = matrix_input[(row_idx + i) * width + col_idx + 32];
+        }
+    }
+    __syncthreads();
+
+    row_idx = col_start + threadIdx.y;
+    col_idx = row_start + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < 64; i+=8){
+        if(col_idx < height && row_idx + i < width){
+            matrix_output[(row_idx + i) * height + col_idx] = tile[threadIdx.x][threadIdx.y + i];
+            if(col_idx + 32 < height) matrix_output[(row_idx + i) * height + col_idx + 32] = tile[threadIdx.x + 32][threadIdx.y + i];
+        }
+    }
+}
 
 int main(int argc, char** argv) {
     if(argc < 2) {
@@ -285,6 +326,27 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "naive v2: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // naive 64
+    // ---------------------------------
+    {
+        dim3 threadsPerBlock(32, 8);
+        dim3 blocksPerGrid((col + 63)/64, (row+63)/64);
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_naive_64<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
+        }
+        std::cout << "naive 64: " << duration/max_run << std::endl;
         duration = 0.0;
     }
 
@@ -373,7 +435,7 @@ int main(int argc, char** argv) {
     }
 
     // ---------------------------------
-    // shared opt
+    // shared opt 32
     // ---------------------------------
     {
         dim3 threadsPerBlock(32, 8);
@@ -435,6 +497,26 @@ int main(int argc, char** argv) {
         duration = 0.0;
     }
 
+    // ---------------------------------
+    // shared opt 64
+    // ---------------------------------
+    {
+        dim3 threadsPerBlock(32, 8);
+        dim3 blocksPerGrid((col + 64 - 1)/64, (row + 64 - 1)/64);
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_shared_64<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
+        }
+        std::cout << "shared opt 64: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
 
     CUDA_CHECK(cudaFree(a));
     CUDA_CHECK(cudaFree(b));
