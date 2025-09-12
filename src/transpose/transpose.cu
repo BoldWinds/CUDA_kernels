@@ -12,8 +12,7 @@ __global__ void verify_transpose_kernel(const float* input, const float* output,
         float val_A = input[index_A];
         float val_B = output[index_B];
 
-        const float epsilon = 1e-6f;
-        if (fabs(val_A - val_B) > epsilon) {
+        if (val_A != val_B) {
             atomicAdd(error_count, 1);
         }
     }
@@ -25,8 +24,8 @@ void verify_transpose(const float* input, const float* output, unsigned rows, un
     
     CUDA_CHECK(cudaMemset(error_count, 0, sizeof(int)));
     verify_transpose_kernel<<<gridDim, blockDim>>>(input, output, rows, cols, error_count);
-    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     int h_error_count = 0;
     CUDA_CHECK(cudaMemcpy(&h_error_count, error_count, sizeof(int), cudaMemcpyDeviceToHost));
@@ -101,7 +100,7 @@ __global__ void transpose_x4(float* matrix_input, float* matrix_output, unsigned
 
 #define TILE_SIZE 16
 
-__global__ void transpose_shared(float* matrix_input, float* matrix_output, const unsigned height, unsigned width) {
+__global__ void transpose_shared(const float* matrix_input, float* matrix_output, const unsigned height, unsigned width) {
     __shared__ float tile[TILE_SIZE + 1][TILE_SIZE + 1];
     unsigned row_idx = TILE_SIZE * blockIdx.y + threadIdx.y;
     unsigned col_idx = TILE_SIZE * blockIdx.x + threadIdx.x;
@@ -113,10 +112,62 @@ __global__ void transpose_shared(float* matrix_input, float* matrix_output, cons
 
     row_idx = TILE_SIZE * blockIdx.x + threadIdx.y;
     col_idx = TILE_SIZE * blockIdx.y + threadIdx.x;
-    if(col_idx < width && row_idx < height) {
+    if(col_idx < height && row_idx < width) {
         matrix_output[row_idx * height + col_idx] = tile[threadIdx.x][threadIdx.y];
     }
 
+}
+
+#define TILE_DIM 32
+__global__ void transpose_shared_optimized(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+    unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
+    unsigned col_idx = blockIdx.x * TILE_DIM + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < width && row_idx + i < height){
+            tile[threadIdx.y + i][threadIdx.x] = matrix_input[(row_idx + i) * width + col_idx];
+        }
+    }
+    __syncthreads();
+
+    row_idx = blockIdx.x * TILE_DIM + threadIdx.y;
+    col_idx = blockIdx.y * TILE_DIM + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < height && row_idx + i < width){
+            matrix_output[(row_idx + i) * height + col_idx] = tile[threadIdx.x][threadIdx.y + i];
+        }
+    }
+}
+
+__global__ void transpose_shared_optimized_x4(float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+    unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
+    unsigned col_idx = blockIdx.x * TILE_DIM + 4 * threadIdx.x;
+
+    if(col_idx < width && row_idx < height) {
+        float4 reg_input = reinterpret_cast<float4*>(&matrix_input[row_idx * width + col_idx])[0];
+        tile[threadIdx.y][4 * threadIdx.x] = reg_input.x;
+        if(col_idx + 1 < width) tile[threadIdx.y][4 * threadIdx.x + 1] = reg_input.y;
+        if(col_idx + 2 < width) tile[threadIdx.y][4 * threadIdx.x + 2] = reg_input.z;
+        if(col_idx + 3 < width) tile[threadIdx.y][4 * threadIdx.x + 3] = reg_input.w;
+    }
+
+    __syncthreads();
+    
+    const unsigned new_row = threadIdx.y / 4;
+    const unsigned new_col = threadIdx.x + (threadIdx.y % 4) * 8;
+    row_idx = blockIdx.x * TILE_DIM + new_row;
+    col_idx = blockIdx.y * TILE_DIM + new_col;
+
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(row_idx + i < width && col_idx < height) {
+            matrix_output[(row_idx + i) * height + col_idx] = tile[new_col][new_row + i];
+        }
+    }
 }
 
 
@@ -155,6 +206,7 @@ int main(int argc, char** argv) {
             timer->stop();
             duration += timer->elapsed();
             verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         cublasDestroy(handle);
         std::cout << "cuBLAS: " << duration / max_run << " ms" << std::endl;
@@ -176,6 +228,7 @@ int main(int argc, char** argv) {
             timer->stop();
             duration += timer->elapsed();
             verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "naive: " << duration/max_run << std::endl;
         duration = 0.0;
@@ -196,6 +249,7 @@ int main(int argc, char** argv) {
             timer->stop();
             duration += timer->elapsed();
             verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "naive v2: " << duration/max_run << std::endl;
         duration = 0.0;
@@ -216,6 +270,7 @@ int main(int argc, char** argv) {
             timer->stop();
             duration += timer->elapsed();
             verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "naive 1D: " << duration/max_run << std::endl;
         duration = 0.0;
@@ -236,6 +291,7 @@ int main(int argc, char** argv) {
             timer->stop();
             duration += timer->elapsed();
             verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "naive 1D v2: " << duration/max_run << std::endl;
         duration = 0.0;
@@ -256,6 +312,7 @@ int main(int argc, char** argv) {
             timer->stop();
             duration += timer->elapsed();
             verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "x4: " << duration/max_run << std::endl;
         duration = 0.0;
@@ -276,8 +333,51 @@ int main(int argc, char** argv) {
             timer->stop();
             duration += timer->elapsed();
             verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
         }
         std::cout << "shared: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // shared opt
+    // ---------------------------------
+    {
+        dim3 threadsPerBlock(32, 8);
+        dim3 blocksPerGrid((col + 32 - 1)/32, (row + 32 - 1)/32);
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_shared_optimized<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
+        }
+        std::cout << "shared opt: " << duration/max_run << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // shared opt x4
+    // ---------------------------------
+    {
+        dim3 threadsPerBlock(8, 32);
+        dim3 blocksPerGrid((col + 32 - 1)/32, (row + 32 - 1)/32);
+        for(int i = 0; i < max_run; i++) {
+            generateRandomData(a, row * col);
+            timer->start();
+            transpose_shared_optimized_x4<<<blocksPerGrid, threadsPerBlock>>>(a, b, row, col);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            timer->stop();
+            duration += timer->elapsed();
+            verify_transpose(a, b, row, col, error_count);
+            CUDA_CHECK(cudaMemset(b, 0, row * col * sizeof(float)));
+        }
+        std::cout << "shared opt x4: " << duration/max_run << std::endl;
         duration = 0.0;
     }
 

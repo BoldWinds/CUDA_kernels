@@ -133,3 +133,64 @@ __global__ void transpose_shared(float* matrix_input, float* matrix_output, cons
 
 这样做消除了全局内存的非合并访问,在nsight compute的分析结果中, 仍然性能不如native版本. 因为它虽然消除了全局内存的非合并访问, 但是引入了shared memory的非合并访问, 有一半对shared memory的访问都是非合并的, 该怎么解决呢? 
 
+优化的办法就是降低bank conflict. 一般来说, 给shared memory添加padding就能解决了. 但是由于在这个kernel中, shared memory的大小为$16\*16$, 这导致即使添加了一个padding, 也会发生2-way bank conflict: 比如对于threadIdx.y为0和1, 此时为第一个warp, 那么对于(0,0)和(1,15), 他们都是bank 0, 产生冲突. 所以为了解决这个问题, 要把shared memory的大小调整为$32\*32$, 这样通过添加padding就能避免bank conflict发生了.
+```cuda
+#define TILE_DIM 32
+__global__ void transpose_shared_optimized(const float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+    unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
+    unsigned col_idx = blockIdx.x * TILE_DIM + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < width && row_idx + i < height){
+            tile[threadIdx.y + i][threadIdx.x] = matrix_input[(row_idx + i) * width + col_idx];
+        }
+    }
+    __syncthreads();
+
+    row_idx = blockIdx.x * TILE_DIM + threadIdx.y;
+    col_idx = blockIdx.y * TILE_DIM + threadIdx.x;
+
+    #pragma unroll
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(col_idx < height && row_idx + i < width){
+            matrix_output[(row_idx + i) * height + col_idx] = tile[threadIdx.x][threadIdx.y + i];
+        }
+    }
+}
+
+__global__ void transpose_shared_optimized_x4(float* matrix_input, float* matrix_output, const unsigned height, const unsigned width) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+    unsigned row_idx = blockIdx.y * TILE_DIM + threadIdx.y;
+    unsigned col_idx = blockIdx.x * TILE_DIM + 4 * threadIdx.x;
+
+    if(col_idx < width && row_idx < height) {
+        float4 reg_input = reinterpret_cast<float4*>(&matrix_input[row_idx * width + col_idx])[0];
+        tile[threadIdx.y][4 * threadIdx.x] = reg_input.x;
+        if(col_idx + 1 < width) tile[threadIdx.y][4 * threadIdx.x + 1] = reg_input.y;
+        if(col_idx + 2 < width) tile[threadIdx.y][4 * threadIdx.x + 2] = reg_input.z;
+        if(col_idx + 3 < width) tile[threadIdx.y][4 * threadIdx.x + 3] = reg_input.w;
+    }
+
+    __syncthreads();
+    
+    const unsigned new_row = threadIdx.y / 4;
+    const unsigned new_col = threadIdx.x + (threadIdx.y % 4) * 8;
+    row_idx = blockIdx.x * TILE_DIM + new_row;
+    col_idx = blockIdx.y * TILE_DIM + new_col;
+
+    for(int i = 0; i < TILE_DIM; i+=8){
+        if(row_idx + i < width && col_idx < height) {
+            matrix_output[(row_idx + i) * height + col_idx] = tile[new_col][new_row + i];
+        }
+    }
+}
+```
+
+第一份代码的block维度为(32, 8), 一个warp需要处理TILE中四行的数据; 第二份代码则是用了向量化加速, block维度为(8,32), 每8个thread读取一行数据(一次读四个). 但是这两份代码的性能几乎没有差异, 说明向量化对于共享内存来说不是一个很关键的优化手段. 而且说实话, 向量化应该是一种作弊的优化手段, 因为它要求参数中的指针不能是const的, 但是cublas的指针全部是const类型.
+
+此时性能已经达到cublas版本的91%, 只比它慢1ms了. 还剩下最后一个优化方法, async
+
+## shared async
+
