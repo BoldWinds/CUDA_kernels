@@ -5,6 +5,9 @@
 #include <curand_kernel.h>
 #include <cuda_fp16.h>
 
+#define CEIL(a, b) ((a + b - 1) / (b))
+#define FLOAT4(value) (reinterpret_cast<float4*>(&(value))[0])
+
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
     if (code != cudaSuccess) {
         fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
