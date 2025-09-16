@@ -7,6 +7,7 @@
 
 #define CEIL(a, b) ((a + b - 1) / (b))
 #define FLOAT4(value) (reinterpret_cast<float4*>(&(value))[0])
+#define CONST_FLOAT4(value) (reinterpret_cast<const float4*>(&(value))[0])
 
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
     if (code != cudaSuccess) {

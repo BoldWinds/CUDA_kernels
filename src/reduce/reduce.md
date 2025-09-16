@@ -86,7 +86,7 @@ __global__ void reduce_sum_opt(const float* data, const unsigned n, float* outpu
 }
 ```
 
-这个版本的代码已经可以做到与cublas一样快了
+这个版本的代码已经可以做到几乎与cublas一样快了，慢大概百分之零点几
 
 ## shuffle
 
@@ -158,3 +158,48 @@ __global__ void reduce_sum_shuffle_cg(const float* data, const unsigned n, float
 ```
 
 二者的性能几乎一样，并且与前面的opt版本也并无不同。主要是因为计算访存比太低了，主要优化好访存就行。
+
+## reduce max
+
+为了给softmax做准备，就先写了一个reduce max的kernel。
+使用了reduce sum中的所有优化方法，并顺便把忘记的x4读取给补上了：
+```cuda
+__global__ void reduce_max_x4(const float* input, const unsigned n, float* output) {
+    __shared__ float smem[32];
+
+    auto grid = cg::this_grid();
+    const unsigned offset = 4 * grid.thread_rank();
+    const unsigned stride = 4 * grid.num_threads();
+
+    float max = FLT_MIN;
+    for (unsigned i = offset; i < n; i += stride) {
+        if(i + 3 < n){
+            float4 reg = CONST_FLOAT4(input[i]);
+            max = fmaxf(max, fmaxf(fmaxf(reg.x, reg.y), fmaxf(reg.z, reg.w)));
+        }else {
+            #pragma unroll
+            for(; i < n; i++) {
+                max = fmaxf(max, input[i]);
+            }
+        }
+    }
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+
+    max = cg::reduce(warp, max, cg::greater<float>());
+
+    if(warp.thread_rank() == 0) {
+        smem[warp.meta_group_rank()] = max;
+    }
+    __syncthreads();
+
+    if(warp.meta_group_rank() == 0) {
+        max = warp.thread_rank() < warp.meta_group_size() ? smem[warp.thread_rank()] : FLT_MIN;
+        max = cg::reduce(warp, max, cg::greater<float>());
+        if(warp.thread_rank() == 0) output[grid.block_rank()] = max;
+    }
+}
+```
+
+这个版本的性能做到了与cublas一模一样
