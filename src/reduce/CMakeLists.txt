@@ -27,3 +27,18 @@ target_link_libraries(reduce_max PRIVATE
 set_target_properties(reduce_max PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+add_executable(softmax
+    softmax.cu
+)
+
+target_link_libraries(softmax PRIVATE 
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::curand
+    common_headers
+)
+
+set_target_properties(softmax PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

@@ -71,6 +71,54 @@ __global__ void reduce_max_x4(const float* input, const unsigned n, float* outpu
     }
 }
 
+__device__ static float atomicMax(float* address, float val) {
+	int* address_as_i = (int*)address;  // address转为int指针
+	int old = *address_as_i;  // address中的旧值，用int解码
+	int assumed;
+	do {
+		assumed = old;  // assumed存储旧值
+		old = atomicCAS(address_as_i, assumed, __float_as_int(fmaxf(val, __int_as_float(assumed))));
+	} while (assumed != old);
+	return __int_as_float(old);
+}
+
+__global__ void reduce_max_atomic(const float* input, const unsigned n, float* d_final_max) {
+    __shared__ float smem[32];
+
+    auto grid = cg::this_grid();
+    const unsigned offset = 4 * grid.thread_rank();
+    const unsigned stride = 4 * grid.num_threads();
+
+    float max = FLT_MIN;
+    for (unsigned i = offset; i < n; i += stride) {
+        if(i + 3 < n){
+            float4 reg = *reinterpret_cast<const float4*>(&input[i]);
+            max = fmaxf(max, fmaxf(fmaxf(reg.x, reg.y), fmaxf(reg.z, reg.w)));
+        } else {
+            #pragma unroll
+            for(; i < n; i++) {
+                max = fmaxf(max, input[i]);
+            }
+        }
+    }
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+
+    max = cg::reduce(warp, max, cg::greater<float>());
+
+    if(warp.thread_rank() == 0) smem[warp.meta_group_rank()] = max;
+    __syncthreads();
+
+    if(warp.meta_group_rank() == 0) {
+        max = warp.thread_rank() < warp.meta_group_size() ? smem[warp.thread_rank()] : FLT_MIN;
+        max = cg::reduce(warp, max, cg::greater<float>());
+        if(warp.thread_rank() == 0) {
+            atomicMax(d_final_max, max);
+        }
+    }
+}
+
 
 int main(int argc, char** argv) {
     if(argc < 2) {
@@ -157,6 +205,28 @@ int main(int argc, char** argv) {
         duration = 0.0;
         CUDA_CHECK(cudaFree(d_max));
         CUDA_CHECK(cudaFree(d_temp));
+    }
+
+
+    // ---------------------------------
+    // max atomic
+    // ---------------------------------
+    {
+        const unsigned temp_size = 246;
+        float *d_max, *d_temp, max;
+        CUDA_CHECK(cudaMalloc(&d_max, sizeof(float)));
+        for(int i = 0; i < max_run; i++) {
+            timer->start();
+            reduce_max_atomic<<<temp_size, 256>>>(data, n, d_max);
+            CUDA_CHECK(cudaMemcpy(&max, d_max, sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            duration += timer->stop();
+            std::cout << max << std::endl;
+        }
+        std::cout << "max atomic x4: " << duration/max_run << " ms" << std::endl;
+        duration = 0.0;
+        CUDA_CHECK(cudaFree(d_max));
     }
     CUDA_CHECK(cudaFree(data));
 }

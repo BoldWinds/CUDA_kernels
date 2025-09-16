@@ -203,3 +203,166 @@ __global__ void reduce_max_x4(const float* input, const unsigned n, float* outpu
 ```
 
 这个版本的性能做到了与cublas一模一样
+
+## reduce with atomic
+
+前面的归约操作都需要启动两个kernel，但其实第二个kernel的工作量非常低下；而且两个kernel之间是通过global memory传递，有一个隐性的没参与分析的全局内存分配时间，而且全局内存传递数据也算不上多快。
+为此我尝试一下把完成一次归约操作所需要调用的两次归约kernel合并为一个归约kernel，先归约然后最后的几百个数值用原子操作计算结果。
+
+```cuda
+
+__device__ static float atomicMax(float* address, float val) {
+	int* address_as_i = (int*)address;  // address转为int指针
+	int old = *address_as_i;  // address中的旧值，用int解码
+	int assumed;
+	do {
+		assumed = old;  // assumed存储旧值
+		old = atomicCAS(address_as_i, assumed, __float_as_int(fmaxf(val, __int_as_float(assumed))));
+	} while (assumed != old);
+	return __int_as_float(old);
+}
+
+__global__ void reduce_max_atomic(const float* input, const unsigned n, float* d_final_max) {
+    __shared__ float smem[32];
+
+    auto grid = cg::this_grid();
+    const unsigned offset = 4 * grid.thread_rank();
+    const unsigned stride = 4 * grid.num_threads();
+
+    float max = FLT_MIN;
+    for (unsigned i = offset; i < n; i += stride) {
+        if(i + 3 < n){
+            float4 reg = *reinterpret_cast<const float4*>(&input[i]);
+            max = fmaxf(max, fmaxf(fmaxf(reg.x, reg.y), fmaxf(reg.z, reg.w)));
+        } else {
+            #pragma unroll
+            for(; i < n; i++) {
+                max = fmaxf(max, input[i]);
+            }
+        }
+    }
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+
+    max = cg::reduce(warp, max, cg::greater<float>());
+
+    if(warp.thread_rank() == 0) smem[warp.meta_group_rank()] = max;
+    __syncthreads();
+
+    if(warp.meta_group_rank() == 0) {
+        max = warp.thread_rank() < warp.meta_group_size() ? smem[warp.thread_rank()] : FLT_MIN;
+        max = cg::reduce(warp, max, cg::greater<float>());
+        if(warp.thread_rank() == 0) {
+            atomicMax(d_final_max, max);
+        }
+    }
+}
+```
+
+结果是性能几乎不受影响，甚至还更快了一点
+
+## softmax
+
+```cuda
+
+__constant__ float const_max, const_sum;
+
+__global__ void softmax_max(const float* input, const unsigned n, float* output) {
+    __shared__ float smem[32];
+
+    auto grid = cg::this_grid();
+    const unsigned offset = 4 * grid.thread_rank();
+    const unsigned stride = 4 * grid.num_threads();
+
+    float max = MIN_EXP_F32;
+    for (unsigned i = offset; i < n; i += stride) {
+        if(i + 3 < n){
+            float4 reg = CONST_FLOAT4(input[i]);
+            max = fmaxf(max, fmaxf(fmaxf(reg.x, reg.y), fmaxf(reg.z, reg.w)));
+        }else {
+            #pragma unroll
+            for(; i < n; i++) {
+                max = fmaxf(max, input[i]);
+            }
+        }
+    }
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+
+    max = cg::reduce(warp, max, cg::greater<float>());
+
+    if(warp.thread_rank() == 0) {
+        smem[warp.meta_group_rank()] = max;
+    }
+    __syncthreads();
+
+    if(warp.meta_group_rank() == 0) {
+        max = warp.thread_rank() < warp.meta_group_size() ? smem[warp.thread_rank()] : MIN_EXP_F32;
+        max = cg::reduce(warp, max, cg::greater<float>());
+        if(warp.thread_rank() == 0) output[grid.block_rank()] = max;
+    }
+}
+
+__global__ void softmax_sum(const float* input, const unsigned n, float* output) {
+    __shared__ float smem[32];
+
+    auto grid = cg::this_grid();
+    const unsigned offset = 4 * grid.thread_rank();
+    const unsigned stride = 4 * grid.num_threads();
+
+    float sum = 0.0f;
+    for (unsigned i = offset; i < n; i += stride) {
+        if(i + 3 < n){
+            float4 reg = CONST_FLOAT4(input[i]);
+            sum += (expf(CLIP(reg.x - const_max)) + expf(CLIP(reg.y - const_max)) + expf(CLIP(reg.z - const_max)) + expf(CLIP(reg.w - const_max)));
+        }else {
+            #pragma unroll
+            for(; i < n; i++) {
+                sum += expf(CLIP(input[i] - const_max));
+            }
+        }
+    }
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+
+    sum = cg::reduce(warp, sum, cg::plus<float>());
+
+    if(warp.thread_rank() == 0) {
+        smem[warp.meta_group_rank()] = sum;
+    }
+    __syncthreads();
+
+    if(warp.meta_group_rank() == 0) {
+        sum = warp.thread_rank() < warp.meta_group_size() ? smem[warp.thread_rank()] : 0.0f;
+        sum = cg::reduce(warp, sum, cg::plus<float>());
+        if(warp.thread_rank() == 0) output[grid.block_rank()] = sum;
+    }
+}
+
+__global__ void softmax_normalize(const float* input, float* output, const unsigned n){
+    auto grid = cg::this_grid();
+    const unsigned offset = 4 * grid.thread_rank();
+    const unsigned stride = 4 * grid.num_threads();
+
+    for (unsigned i = offset; i < n; i += stride) {
+        if(i + 3 < n){
+            float4 reg = CONST_FLOAT4(input[i]);
+            reg.x = expf(CLIP(reg.x - const_max))/const_sum;
+            reg.y = expf(CLIP(reg.y - const_max))/const_sum;
+            reg.z = expf(CLIP(reg.z - const_max))/const_sum;
+            reg.w = expf(CLIP(reg.w - const_max))/const_sum;
+            FLOAT4(output[i]) = reg;
+        }else {
+            #pragma unroll
+            for(; i < n; i++) {
+                output[i] = expf(CLIP(input[i] - const_max))/const_sum;
+            }
+        }
+    }
+}
+```
+
+没什么好说的，处理2^30数据大概需要20ms，比pytorch的300ms快太多了
