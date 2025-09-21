@@ -56,7 +56,53 @@ __global__ void sgemm_naive(
 
 在这个版本中我使用了不少的优化方法。首先，每个block有256线程，处理32*32的结果矩阵子块；对于a和b的32\*k的块，每次读入32\*32大小，迭代计算。
 
-这个版本的性能做到了cuBLAS的八分之一，性能相当差。主要问题在于，cuBLAS首先是没有Global到L1 Cache的访问的；并且在总读取量上，无论是读取Device Memory还是访问Shared Memory，我的访问量都是cuBLAS的整整20倍，说明很多可以省去的计算我没有做到
+这个版本的性能做到了cuBLAS的7%，性能相当差。主要问题在于，cuBLAS首先是没有Global到L1 Cache的访问的；并且在总读取量上，无论是读取Device Memory还是访问Shared Memory，我的访问量都是cuBLAS的整整20倍，说明很多可以省去的计算我没有做到；
+除此以外，Warp Stall的原因中，Stall MIO Throttle、Stall Long Scoreboard、Stall Wait和Stall Short。想要进行优化，就要降低这几种Stall，而Stall MIO Throttle一般就是因为读写Shared Memory所引起的，其他的几种一般也是由于访存引起，适当添加每个warp的计算强度可以掩盖一定的stall
 
 ## sgemm opt
+
+```cuda
+__global__ void sgemm_shared(
+    const int m, const int n, const int k, 
+    const float* a, const int lda, 
+    const float* b, const int ldb, 
+    float *c, const int ldc
+){
+    const int tile_size = 32, output_row = 32, output_col = 32;
+    __shared__ float sub_a[output_col][output_row];
+    __shared__ float sub_b[output_col][output_row];
+    
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+    const int start_row_a = blockIdx.x * tile_size;
+    const int start_col_b = blockIdx.y * tile_size;
+
+    const unsigned elementsPerThread = 4; // tile_size * tile_size / block.num_threads()
+    float output[elementsPerThread] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for(int start_col_a_row_b = 0; start_col_a_row_b < k; start_col_a_row_b += output_col) {
+        // 读入共享内存
+        for(int i = warp.meta_group_rank(); i < output_col; i += warp.meta_group_size()) {
+           sub_a[i][warp.thread_rank()] = a[(start_col_a_row_b + i)* lda + start_row_a + warp.thread_rank()];
+        }
+        for(int i = warp.meta_group_rank(); i < output_row; i += warp.meta_group_size()) {
+           sub_b[i][warp.thread_rank()] = b[(start_col_b + i)* ldb + start_col_a_row_b + warp.thread_rank()];
+        }
+        __syncthreads();
+        // 计算
+        // 每个warp负责整个sub_a乘sub_b中的1列，计算的结果对应结果tile的一列
+        for(int i = 0; i < 4; i++) {
+            for(int j = 0; j < 32; j++){
+                output[i] += sub_a[j][warp.thread_rank()] * sub_b[warp.meta_group_rank() + i * warp.meta_group_size()][j];
+            }
+        }
+        __syncthreads(); 
+    }
+    for(int i = 0; i < 4; i++) {
+        c[(start_col_b + warp.meta_group_rank() + i * warp.meta_group_size())* ldc + start_row_a + warp.thread_rank()] = output[i];
+    }
+}
+```
+
+优化后的版本，没有改变访问全局内存的方式，但是优化了共享内存的访问。把output的tile从共享内存中移除，转而使用寄存器存储，大大提高了性能，达到了cuBLAS的20%性能。并且，Stall MIO Throttle显著下降，虽然没有下降到与cuBLAS相同的等级，但也是有所提升。除此以外，对全局内存的读取方面没有大提升，仍然读取了很多的冗余数据。
 
