@@ -5,6 +5,9 @@
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
+#define FLOAT2(value) (reinterpret_cast<float2*>(&(value))[0])
+#define CONST_FLOAT2(value) (reinterpret_cast<const float2*>(&(value))[0])
+
 __global__ void verify_result_kernel(
     const float* computed,
     const float* standard,
@@ -211,6 +214,53 @@ __global__ void sgemm_thread_tile(
     }
 }
 
+// 让一个thread负责处理连续的线程
+__global__ void sgemm_thread_vec_tile(
+    const int m, const int n, const int k, 
+    const float* a, const int lda, 
+    const float* b, const int ldb, 
+    float *c, const int ldc
+){
+    const int tile_size = 32;
+    __shared__ float sub_a[tile_size][tile_size + 1];
+    __shared__ float sub_b[tile_size][tile_size + 1];
+    
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+    const int start_row_a = blockIdx.x * tile_size;
+    const int start_col_b = blockIdx.y * tile_size;
+
+    float4 output_tile = {0.0f, 0.0f, 0.0f, 0.0f};
+    const unsigned tile_start_row = 4 * (block.thread_rank() % 8);
+    const unsigned tile_start_col = block.thread_rank() / 8;
+
+    for(int start_col_a_row_b = 0; start_col_a_row_b < k; start_col_a_row_b += tile_size) {
+        // 读入共享内存
+        const float* a_start = a + start_col_a_row_b * lda + start_row_a;
+        const float* b_start = b + start_col_b * ldb + start_col_a_row_b;
+        for(int i = warp.meta_group_rank(); i < tile_size; i += warp.meta_group_size()) {
+           sub_a[i][warp.thread_rank()] = a_start[i * lda  + warp.thread_rank()];
+        }
+        for(int i = warp.meta_group_rank(); i < tile_size; i += warp.meta_group_size()) {
+           sub_b[i][warp.thread_rank()] = b_start[i * ldb + warp.thread_rank()];
+        }
+        __syncthreads();
+        // 计算
+        // 每个thread负责计算1*4
+        for(int i = 0; i < 32; i++) {
+            float b_val = sub_b[tile_start_col][i];
+            output_tile.x += sub_a[i][tile_start_row] * b_val;
+            output_tile.y += sub_a[i][tile_start_row + 1] * b_val;
+            output_tile.z += sub_a[i][tile_start_row + 2] * b_val;
+            output_tile.w += sub_a[i][tile_start_row + 3] * b_val;
+        }
+        
+    }
+    // 写回
+    float* c_start = c + start_col_b * ldc + start_row_a;
+    *(reinterpret_cast<float4*>(&c_start[tile_start_col * ldc + tile_start_row])) = output_tile;
+}
+
 
 int main(int argc, char** argv) {
     if(argc < 2) {
@@ -304,6 +354,24 @@ int main(int argc, char** argv) {
             verify_result(c, standard_output, m, n, m, m);
         }
         std::cout << "thread tile: " << duration / max_run << " ms" << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // vec thread tile
+    // ---------------------------------
+    {
+        const unsigned threadsPerBlock = 256;
+        const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
+        for(int i = 0; i < max_run; i++) {
+            timer->start();
+            sgemm_thread_vec_tile<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            duration += timer->stop();
+            verify_result(c, standard_output, m, n, m, m);
+        }
+        std::cout << "vector tile: " << duration / max_run << " ms" << std::endl;
         duration = 0.0;
     }
 

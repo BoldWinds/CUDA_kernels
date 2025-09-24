@@ -180,3 +180,5 @@ __global__ void sgemm_thread_tile(
 
 分析显示，计算利用率达到92%，内存吞吐率达到92%，性能提升12%，达到cuBLAS的22%的性能
 
+除此以外, 我还探究了一下不使用Shared Memory做中转来实现合并访问方法: 让一个线程处理全局内存中连续的四个元素, 写入的时候直接float4向量化写入即可.
+但是这样做并没有提升性能, 是因为MIO Throttle Stall提升了: 一个thread原本需要访问两行两列, 变成了四行一列, 对shared memory的压力增加了25%; 但是优化后省去的写回前shared memory中转都不会造成这么多的MIO Throttle Stall, 所以性能变差了
