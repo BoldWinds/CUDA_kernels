@@ -390,6 +390,70 @@ __global__ void sgemm_64_opt(
     FLOAT4(c_ptr[ldc * (thraed_tile_col + 3) + thraed_tile_row]) = thread_tile_c[3];
 }
 
+__global__ void sgemm_128(
+    const int m, const int n, const int k, 
+    const float* a, const int lda, 
+    const float* b, const int ldb, 
+    float *c, const int ldc
+){
+    const unsigned BLOCK_TILE_SIZE = 128;
+    __shared__ float block_tile_a[8][BLOCK_TILE_SIZE];
+    __shared__ float block_tile_b[8][BLOCK_TILE_SIZE+4];
+
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<32>(block);
+    auto tile_8 = cg::tiled_partition<8>(block);
+
+    const float* a_ptr = a + blockIdx.x * BLOCK_TILE_SIZE;
+    const float* b_ptr = b + blockIdx.y * BLOCK_TILE_SIZE * ldb;
+    float* c_ptr = c + blockIdx.y * BLOCK_TILE_SIZE * ldb + blockIdx.x * BLOCK_TILE_SIZE;
+
+    // thread tile为4*16
+    float4 thread_tile_c[16] ={0};
+    const unsigned thraed_tile_row = 4 * warp.thread_rank();
+    const unsigned thraed_tile_col = 16 * warp.meta_group_rank();
+
+    for(int start_k = 0; start_k < k; start_k += 8){
+        const float* a_tile_start = a_ptr + start_k * lda;
+        const float* b_tile_start = b_ptr + start_k;
+
+        // 读取a tile
+        (reinterpret_cast<float4*>(block_tile_a[warp.meta_group_rank()]))[warp.thread_rank()] = CONST_FLOAT4(a_tile_start[warp.meta_group_rank() * lda + 4 * warp.thread_rank()]);
+        // 读取b tile
+        #pragma unroll
+        for(int i = tile_8.meta_group_rank(); i < BLOCK_TILE_SIZE; i+=tile_8.meta_group_size()) {
+            // 此处有bank conflict
+            block_tile_b[tile_8.thread_rank()][i] = b_tile_start[i * ldb + tile_8.thread_rank()];
+        }
+        __syncthreads();
+
+        // 计算
+        float reg_a[4];
+        float reg_b[16];
+        
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            #pragma unroll
+            for(int i = 0; i < 4; i++){
+                reg_a[i] = block_tile_a[j][thraed_tile_row + i];
+            }
+            #pragma unroll
+            for(int i = 0; i < 16; i++){
+                reg_b[i] = block_tile_b[j][thraed_tile_col + i];
+                thread_tile_c[i].x += reg_a[0] * reg_b[i];
+                thread_tile_c[i].y += reg_a[1] * reg_b[i];
+                thread_tile_c[i].z += reg_a[2] * reg_b[i];
+                thread_tile_c[i].w += reg_a[3] * reg_b[i];
+            }
+        }
+    }
+    // 写回
+    #pragma unroll
+    for(int i = 0; i < 16; i++){
+        FLOAT4(c_ptr[ldc * (thraed_tile_col + i) + thraed_tile_row]) = thread_tile_c[i];
+    }
+}
+
 int main(int argc, char** argv) {
     if(argc < 2) {
         std::cout << "input max run times!" << std::endl;
@@ -431,77 +495,77 @@ int main(int argc, char** argv) {
         duration = 0.0;
     }
 
-    // ---------------------------------
-    // naive
-    // ---------------------------------
-    {
-        const unsigned threadsPerBlock = 256;
-        const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
-        for(int i = 0; i < max_run; i++) {
-            timer->start();
-            sgemm_naive<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-            duration += timer->stop();
-            verify_result(c, standard_output, m, n, m, m);
-        }
-        std::cout << "naive: " << duration / max_run << " ms" << std::endl;
-        duration = 0.0;
-    }
+    // // ---------------------------------
+    // // naive
+    // // ---------------------------------
+    // {
+    //     const unsigned threadsPerBlock = 256;
+    //     const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
+    //     for(int i = 0; i < max_run; i++) {
+    //         timer->start();
+    //         sgemm_naive<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
+    //         CUDA_CHECK(cudaGetLastError());
+    //         CUDA_CHECK(cudaDeviceSynchronize());
+    //         duration += timer->stop();
+    //         verify_result(c, standard_output, m, n, m, m);
+    //     }
+    //     std::cout << "naive: " << duration / max_run << " ms" << std::endl;
+    //     duration = 0.0;
+    // }
 
-    // ---------------------------------
-    // shared
-    // ---------------------------------
-    {
-        const unsigned threadsPerBlock = 256;
-        const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
-        for(int i = 0; i < max_run; i++) {
-            timer->start();
-            sgemm_shared<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-            duration += timer->stop();
-            verify_result(c, standard_output, m, n, m, m);
-        }
-        std::cout << "shared: " << duration / max_run << " ms" << std::endl;
-        duration = 0.0;
-    }
+    // // ---------------------------------
+    // // shared
+    // // ---------------------------------
+    // {
+    //     const unsigned threadsPerBlock = 256;
+    //     const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
+    //     for(int i = 0; i < max_run; i++) {
+    //         timer->start();
+    //         sgemm_shared<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
+    //         CUDA_CHECK(cudaGetLastError());
+    //         CUDA_CHECK(cudaDeviceSynchronize());
+    //         duration += timer->stop();
+    //         verify_result(c, standard_output, m, n, m, m);
+    //     }
+    //     std::cout << "shared: " << duration / max_run << " ms" << std::endl;
+    //     duration = 0.0;
+    // }
 
-    // ---------------------------------
-    // thread tile
-    // ---------------------------------
-    {
-        const unsigned threadsPerBlock = 256;
-        const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
-        for(int i = 0; i < max_run; i++) {
-            timer->start();
-            sgemm_thread_tile<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-            duration += timer->stop();
-            verify_result(c, standard_output, m, n, m, m);
-        }
-        std::cout << "thread tile: " << duration / max_run << " ms" << std::endl;
-        duration = 0.0;
-    }
+    // // ---------------------------------
+    // // thread tile
+    // // ---------------------------------
+    // {
+    //     const unsigned threadsPerBlock = 256;
+    //     const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
+    //     for(int i = 0; i < max_run; i++) {
+    //         timer->start();
+    //         sgemm_thread_tile<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
+    //         CUDA_CHECK(cudaGetLastError());
+    //         CUDA_CHECK(cudaDeviceSynchronize());
+    //         duration += timer->stop();
+    //         verify_result(c, standard_output, m, n, m, m);
+    //     }
+    //     std::cout << "thread tile: " << duration / max_run << " ms" << std::endl;
+    //     duration = 0.0;
+    // }
 
-    // ---------------------------------
-    // vec thread tile
-    // ---------------------------------
-    {
-        const unsigned threadsPerBlock = 256;
-        const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
-        for(int i = 0; i < max_run; i++) {
-            timer->start();
-            sgemm_thread_vec_tile<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
-            CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
-            duration += timer->stop();
-            verify_result(c, standard_output, m, n, m, m);
-        }
-        std::cout << "vector tile: " << duration / max_run << " ms" << std::endl;
-        duration = 0.0;
-    }
+    // // ---------------------------------
+    // // vec thread tile
+    // // ---------------------------------
+    // {
+    //     const unsigned threadsPerBlock = 256;
+    //     const dim3 blocksPerGrid(CEIL(m, 32), CEIL(n, 32));
+    //     for(int i = 0; i < max_run; i++) {
+    //         timer->start();
+    //         sgemm_thread_vec_tile<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
+    //         CUDA_CHECK(cudaGetLastError());
+    //         CUDA_CHECK(cudaDeviceSynchronize());
+    //         duration += timer->stop();
+    //         verify_result(c, standard_output, m, n, m, m);
+    //     }
+    //     std::cout << "vector tile: " << duration / max_run << " ms" << std::endl;
+    //     duration = 0.0;
+    // }
 
     // ---------------------------------
     // tile 64
@@ -536,6 +600,24 @@ int main(int argc, char** argv) {
             verify_result(c, standard_output, m, n, m, m);
         }
         std::cout << "tile 64 opt: " << duration / max_run << " ms" << std::endl;
+        duration = 0.0;
+    }
+
+    // ---------------------------------
+    // tile 128
+    // ---------------------------------
+    {
+        const unsigned threadsPerBlock = 256;
+        const dim3 blocksPerGrid(CEIL(m, 128), CEIL(n, 128));
+        for(int i = 0; i < max_run; i++) {
+            timer->start();
+            sgemm_128<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            duration += timer->stop();
+            verify_result(c, standard_output, m, n, m, m);
+        }
+        std::cout << "tile 128: " << duration / max_run << " ms" << std::endl;
         duration = 0.0;
     }
     CUDA_CHECK(cudaFree(a));
