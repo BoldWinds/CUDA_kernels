@@ -261,6 +261,63 @@ __global__ void sgemm_thread_vec_tile(
     *(reinterpret_cast<float4*>(&c_start[tile_start_col * ldc + tile_start_row])) = output_tile;
 }
 
+__global__ void sgemm_64(
+    const int m, const int n, const int k, 
+    const float* a, const int lda, 
+    const float* b, const int ldb, 
+    float *c, const int ldc
+){
+    const unsigned BLOCK_TILE_SIZE = 64;
+    const unsigned THREAD_TILE_SIZE = 4;
+    __shared__ float block_tile_a[BLOCK_TILE_SIZE][BLOCK_TILE_SIZE];
+    __shared__ float block_tile_b[BLOCK_TILE_SIZE][BLOCK_TILE_SIZE+1];
+
+    auto block = cg::this_thread_block();
+    auto tile_64 = cg::tiled_partition<BLOCK_TILE_SIZE>(block);
+    auto warp = cg::tiled_partition<32>(block);
+
+    const float* a_ptr = a + blockIdx.x * BLOCK_TILE_SIZE;
+    const float* b_ptr = b + blockIdx.y * BLOCK_TILE_SIZE * ldb;
+    float* c_ptr = c + blockIdx.y * BLOCK_TILE_SIZE * ldb + blockIdx.x * BLOCK_TILE_SIZE;
+
+    float4 thread_tile_c[THREAD_TILE_SIZE] ={0};
+    const unsigned thraed_tile_row = THREAD_TILE_SIZE * (block.thread_rank() / (BLOCK_TILE_SIZE/THREAD_TILE_SIZE));
+    const unsigned thraed_tile_col = THREAD_TILE_SIZE * (block.thread_rank() % (BLOCK_TILE_SIZE/THREAD_TILE_SIZE));
+
+    float4 *shared_prt = (float4*)block_tile_a;
+    for(int start_k = 0; start_k < k; start_k += BLOCK_TILE_SIZE){
+        const float* a_tile_start = a_ptr + start_k * lda;
+        const float* b_tile_start = b_ptr + start_k;
+
+        // 读共享内存
+        #pragma unroll
+        for(int i = tile_64.meta_group_rank(); i < BLOCK_TILE_SIZE; i+=tile_64.meta_group_size()) {
+            block_tile_a[i][tile_64.thread_rank()] = a_tile_start[i * lda + tile_64.thread_rank()];
+        }
+        #pragma unroll
+        for(int i = tile_64.meta_group_rank(); i < BLOCK_TILE_SIZE; i+=tile_64.meta_group_size()) {
+            block_tile_b[i][tile_64.thread_rank()] = b_tile_start[i * ldb + tile_64.thread_rank()];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for(int i = 0; i < THREAD_TILE_SIZE; i++ ){
+            for(int j = 0; j < BLOCK_TILE_SIZE; j++){
+                float b_val = block_tile_b[thraed_tile_col + i][j];
+                thread_tile_c[i].x += block_tile_a[j][thraed_tile_row] * b_val;
+                thread_tile_c[i].y += block_tile_a[j][thraed_tile_row + 1] * b_val;
+                thread_tile_c[i].z += block_tile_a[j][thraed_tile_row + 2] * b_val;
+                thread_tile_c[i].w += block_tile_a[j][thraed_tile_row + 3] * b_val;
+            }
+        }
+    }
+
+    // 写回
+    FLOAT4(c_ptr[ldc * thraed_tile_col + thraed_tile_row]) = thread_tile_c[0];
+    FLOAT4(c_ptr[ldc * (thraed_tile_col + 1) + thraed_tile_row]) = thread_tile_c[1];
+    FLOAT4(c_ptr[ldc * (thraed_tile_col + 2) + thraed_tile_row]) = thread_tile_c[2];
+    FLOAT4(c_ptr[ldc * (thraed_tile_col + 3) + thraed_tile_row]) = thread_tile_c[3];
+}
 
 int main(int argc, char** argv) {
     if(argc < 2) {
@@ -375,6 +432,23 @@ int main(int argc, char** argv) {
         duration = 0.0;
     }
 
+    // ---------------------------------
+    // tile 64
+    // ---------------------------------
+    {
+        const unsigned threadsPerBlock = 256;
+        const dim3 blocksPerGrid(CEIL(m, 64), CEIL(n, 64));
+        for(int i = 0; i < max_run; i++) {
+            timer->start();
+            sgemm_64<<<blocksPerGrid, threadsPerBlock>>>(m,n,k,a,m,b,k,c,m);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            duration += timer->stop();
+            verify_result(c, standard_output, m, n, m, m);
+        }
+        std::cout << "tile 64: " << duration / max_run << " ms" << std::endl;
+        duration = 0.0;
+    }
     CUDA_CHECK(cudaFree(a));
     CUDA_CHECK(cudaFree(b));
     CUDA_CHECK(cudaFree(c));

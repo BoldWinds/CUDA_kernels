@@ -182,3 +182,75 @@ __global__ void sgemm_thread_tile(
 
 除此以外, 我还探究了一下不使用Shared Memory做中转来实现合并访问方法: 让一个线程处理全局内存中连续的四个元素, 写入的时候直接float4向量化写入即可.
 但是这样做并没有提升性能, 是因为MIO Throttle Stall提升了: 一个thread原本需要访问两行两列, 变成了四行一列, 对shared memory的压力增加了25%; 但是优化后省去的写回前shared memory中转都不会造成这么多的MIO Throttle Stall, 所以性能变差了
+
+## 64 tile
+
+之前有提到, 我的版本总读取量更高; 后面经过分析, 不难看出, 总读取量是和tile size有关系的, 对于$size*size$大小的tile, 每一个block要读取$size*k$长度的a和$k*size$长度的b, 一共有$m*n/size*size$个block, 那么总读取量就是$m*n*k*2/size$. 所以解决这个问题的好方案就是增大tile, 先增大到$64*64$看看
+
+```cuda
+__global__ void sgemm_64(
+    const int m, const int n, const int k, 
+    const float* a, const int lda, 
+    const float* b, const int ldb, 
+    float *c, const int ldc
+){
+    const unsigned BLOCK_TILE_SIZE = 64;
+    const unsigned THREAD_TILE_SIZE = 4;
+    __shared__ float block_tile_a[BLOCK_TILE_SIZE][BLOCK_TILE_SIZE];
+    __shared__ float block_tile_b[BLOCK_TILE_SIZE][BLOCK_TILE_SIZE+1];
+
+    auto block = cg::this_thread_block();
+    auto tile_64 = cg::tiled_partition<BLOCK_TILE_SIZE>(block);
+    auto warp = cg::tiled_partition<32>(block);
+
+    const float* a_ptr = a + blockIdx.x * BLOCK_TILE_SIZE;
+    const float* b_ptr = b + blockIdx.y * BLOCK_TILE_SIZE * ldb;
+    float* c_ptr = c + blockIdx.y * BLOCK_TILE_SIZE * ldb + blockIdx.x * BLOCK_TILE_SIZE;
+    
+    float4 thread_tile_c[THREAD_TILE_SIZE] ={0};
+    const unsigned thraed_tile_row = THREAD_TILE_SIZE * (block.thread_rank() / (BLOCK_TILE_SIZE/THREAD_TILE_SIZE));
+    const unsigned thraed_tile_col = THREAD_TILE_SIZE * (block.thread_rank() % (BLOCK_TILE_SIZE/THREAD_TILE_SIZE));
+
+    float4 *shared_prt = (float4*)block_tile_a;
+    for(int start_k = 0; start_k < k; start_k += BLOCK_TILE_SIZE){
+        const float* a_tile_start = a_ptr + start_k * lda;
+        const float* b_tile_start = b_ptr + start_k;
+
+        // 读共享内存
+        #pragma unroll
+        for(int i = tile_64.meta_group_rank(); i < BLOCK_TILE_SIZE; i+=tile_64.meta_group_size()) {
+            block_tile_a[i][tile_64.thread_rank()] = a_tile_start[i * lda + tile_64.thread_rank()];
+        }
+        #pragma unroll
+        for(int i = tile_64.meta_group_rank(); i < BLOCK_TILE_SIZE; i+=tile_64.meta_group_size()) {
+            block_tile_b[i][tile_64.thread_rank()] = b_tile_start[i * ldb + tile_64.thread_rank()];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for(int i = 0; i < THREAD_TILE_SIZE; i++ ){
+            for(int j = 0; j < BLOCK_TILE_SIZE; j++){
+                float b_val = block_tile_b[thraed_tile_col + i][j];
+                thread_tile_c[i].x += block_tile_a[j][thraed_tile_row] * b_val;
+                thread_tile_c[i].y += block_tile_a[j][thraed_tile_row + 1] * b_val;
+                thread_tile_c[i].z += block_tile_a[j][thraed_tile_row + 2] * b_val;
+                thread_tile_c[i].w += block_tile_a[j][thraed_tile_row + 3] * b_val;
+            }
+        }
+    }
+
+    // 写回
+    FLOAT4(c_ptr[ldc * thraed_tile_col + thraed_tile_row]) = thread_tile_c[0];
+    FLOAT4(c_ptr[ldc * (thraed_tile_col + 1) + thraed_tile_row]) = thread_tile_c[1];
+    FLOAT4(c_ptr[ldc * (thraed_tile_col + 2) + thraed_tile_row]) = thread_tile_c[2];
+    FLOAT4(c_ptr[ldc * (thraed_tile_col + 3) + thraed_tile_row]) = thread_tile_c[3];
+}
+```
+
+果然，更新这个版本的代码之后，总的读取量仅为cuBLAS版本的1.6倍；性能也大幅提高，达到cuBLAS的30%
+
+继续分析性能问题，发现读取全局内存到共享内存时，存在大量的stall，约占stall总数的一半；观察发现这时的写入一次仅写入32位，看看能否向量化写入，一次操作128位；除此以外，部分shared load指令出现了L1 Wavefronts Shared Excessive，这一般是因为bank conflict，并且出现该问题的指令都不是128位的，别的没有这问题的指令都是128位的
+
+那么下一步的优化就主要是对共享内存读写的优化了，也应当包括向量化的读取/写入
+
+## 64 tile opt
